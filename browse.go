@@ -1,10 +1,11 @@
 package main
 
 import (
+	"code.google.com/p/gosqlite/sqlite"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"io/ioutil"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -15,11 +16,45 @@ import (
 const (
 	phantomJsPath = "phantomjs-1.8.1-macosx/bin/phantomjs"
 	visitJsPath   = "visit.js"
+
+	databaseFile  = "data/db.sqlite3"
+	dataDirectory = "data"
 )
 
 type request struct {
 	ix  int
 	url string
+}
+
+func (r *request) issue(db *sqlite.Conn, dir string) error {
+	var err error
+	var rsp *browseRsp
+
+	for i := 0; i < 5; i++ {
+		rsp, err = browse(dir, r.url)
+		if err == nil {
+			break
+		}
+	}
+
+	if err != nil {
+		if err := db.Exec("INSERT OR REPLACE INTO visit VALUES (?1, ?2, NULL, NULL, NULL, 0)",
+			r.ix,
+			r.url); err != nil {
+			return err
+		}
+	} else {
+		if err := db.Exec("INSERT OR REPLACE INTO visit VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+			r.ix,
+			r.url,
+			rsp.cookies,
+			rsp.stdout,
+			rsp.stderr); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func LoadSites() ([]string, error) {
@@ -37,98 +72,47 @@ func LoadSites() ([]string, error) {
 	return s, nil
 }
 
-// func browse(url, data string) error {
-// 	log.Printf("visit: %s\n", url)
-// 	// make sure we have a valid data dir
-// 	if _, err := os.Stat(data); err != nil {
-// 		if err := os.MkdirAll(data, os.ModePerm); err != nil {
-// 			return err
-// 		}
-// 	}
-
-// 	// open stderr
-// 	stderr, err := os.Create(filepath.Join(data, "stderr"))
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer stderr.Close()
-
-// 	// open stdout
-// 	stdout, err := os.Create(filepath.Join(data, "stdout"))
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer stdout.Close()
-
-// 	// build the command & execute it
-// 	c := exec.Command(phantomJsPath,
-// 		fmt.Sprintf("--cookies-file=%s", filepath.Join(data, "cookies")),
-// 		fmt.Sprintf("--local-storage-path=%s", filepath.Join(data, "local-storage")),
-// 		"visit.js",
-// 		url,
-// 		filepath.Join(data, "cookies.json"))
-
-// 	c.Stderr = stderr
-// 	c.Stdout = stdout
-
-// 	return c.Run()
-// }
-
-type visitor struct {
-	data string
+type browseRsp struct {
+	stdout  string
+	stderr  string
+	cookies string
 }
 
-func (v *visitor) browse(url string) error {
-	log.Printf("visit: %s\n", url)
-	// make sure we have a data dir
-	if _, err := os.Stat(v.data); err != nil {
-		if err := os.MkdirAll(v.data, os.ModePerm); err != nil {
-			return err
-		}
+func newBrowseRsp(stdout, stderr, cookies string) (*browseRsp, error) {
+	o, err := ioutil.ReadFile(stdout)
+	if err != nil {
+		return nil, err
 	}
 
-	// open stderr
-	stderr, err := os.Create(filepath.Join(v.data, "stderr"))
+	e, err := ioutil.ReadFile(stderr)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := ioutil.ReadFile(cookies)
+	if err != nil {
+		return nil, err
+	}
+
+	return &browseRsp{
+		stdout:  string(o),
+		stderr:  string(e),
+		cookies: string(c),
+	}, nil
+}
+
+func clean(dir string) error {
+	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	defer stderr.Close()
 
-	// open stdout
-	stdout, err := os.Create(filepath.Join(v.data, "stdout"))
-	if err != nil {
-		return err
-	}
-	defer stdout.Close()
-
-	cf, sf := v.files()
-	c := exec.Command(phantomJsPath,
-		fmt.Sprintf("--cookies-file=%s", cf),
-		fmt.Sprintf("--local-storage-path=%s", sf),
-		"visit.js",
-		url,
-		filepath.Join(v.data, "cookies.json"))
-
-	c.Stderr = stderr
-	c.Stdout = stdout
-
-	return c.Run()
-}
-
-func (v *visitor) files() (string, string) {
-	return filepath.Join(v.data, "cookies"), filepath.Join(v.data, "local-storage")
-}
-
-func (v *visitor) clean() error {
-	c, s := v.files()
-	if _, err := os.Stat(c); err == nil {
-		if err := os.Remove(c); err != nil {
-			return err
+	for _, file := range files {
+		if file.IsDir() {
+			continue
 		}
-	}
 
-	if _, err := os.Stat(s); err == nil {
-		if err := os.Remove(s); err != nil {
+		if err := os.Remove(filepath.Join(dir, file.Name())); err != nil {
 			return err
 		}
 	}
@@ -136,39 +120,102 @@ func (v *visitor) clean() error {
 	return nil
 }
 
-func browser(req <-chan *request, rsp chan<- error) {
-	var v visitor
-	for r := range req {
-		v.data = filepath.Join("data", fmt.Sprintf("%04d", r.ix))
+func browse(data, url string) (*browseRsp, error) {
+	fmt.Printf("url: %s, data: %s\n", url, data)
+	if err := clean(data); err != nil {
+		return nil, err
+	}
 
-		var err error
+	errFile := filepath.Join(data, "stderr")
+	outFile := filepath.Join(data, "stdout")
 
-		for i := 0; i < 5; i++ {
-			err = v.browse(r.url)
-			if err != nil {
-				log.Printf("failure: %s (retry: %d)", r.url, i)
-				if err := v.clean(); err != nil {
+	stderr, err := os.Create(errFile)
+	if err != nil {
+		return nil, err
+	}
+	defer stderr.Close()
+
+	stdout, err := os.Create(outFile)
+	if err != nil {
+		return nil, err
+	}
+	defer stdout.Close()
+
+	cookiesFile := filepath.Join(data, "cookies")
+	storageFile := filepath.Join(data, "storage")
+	cookiesJson := filepath.Join(data, "cookies.json")
+
+	c := exec.Command(phantomJsPath,
+		fmt.Sprintf("--cookies-file=%s", cookiesFile),
+		fmt.Sprintf("--local-storage-path=%s", storageFile),
+		"visit.js",
+		url,
+		cookiesJson)
+	c.Stderr = stderr
+	c.Stdout = stdout
+
+	if err := c.Run(); err != nil {
+		return nil, err
+	}
+
+	stderr.Close()
+	stdout.Close()
+
+	return newBrowseRsp(outFile, errFile, cookiesJson)
+}
+
+type worker struct {
+	req chan *request
+	rsp chan error
+	n   int
+}
+
+func (w *worker) submit(r *request) {
+	w.req <- r
+}
+
+func (w *worker) close() {
+	close(w.req)
+}
+
+func (w *worker) wait() error {
+	for i := 0; i < w.n; i++ {
+		if err := <-w.rsp; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func startWorker(db *sqlite.Conn, data string, n int) *worker {
+	req := make(chan *request, 1000)
+	rsp := make(chan error)
+	w := worker{
+		req: req,
+		rsp: rsp,
+		n:   n,
+	}
+
+	for i := 0; i < n; i++ {
+		go func() {
+			for r := range req {
+				data := filepath.Join(data, fmt.Sprintf("%04d", r.ix))
+				if err := ensureDir(data); err != nil {
 					rsp <- err
 					return
 				}
-				log.Printf("  (%s) cleaned, retrying...", r.url)
-				continue // try again
+
+				if err := r.issue(db, data); err != nil {
+					rsp <- err
+					return
+				}
 			}
 
-			log.Printf("  (%s) success, moving on...", r.url)
-			break // success
-		}
-
-		if err != nil {
-			// TODO(knorton): write failure into the data directory and move on.
-			rsp <- err
-			return
-		}
-
-		log.Printf("success: %s", r.url)
+			rsp <- nil
+		}()
 	}
 
-	rsp <- nil
+	return &w
 }
 
 func sample(sites []string, n int) []string {
@@ -185,14 +232,50 @@ func sample(sites []string, n int) []string {
 	return s
 }
 
+func ensureDir(dir string) error {
+	if _, err := os.Stat(dir); err != nil {
+		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func openDatabase(dbfile string) (*sqlite.Conn, error) {
+	db, err := sqlite.Open(dbfile)
+	if err != nil {
+		return nil, err
+	}
+
+	if db.Exec(`CREATE TABLE IF NOT EXISTS visit (
+								id INTEGER PRIMARY KEY,
+								url			VARCHAR(255),
+								cookies TEXT,
+								stdout TEXT,
+								stderr TEXT,
+								success INTEGER);`); err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	N := 8
 
 	flagTrial := flag.Int("trial", 0, "")
 
 	flag.Parse()
+
+	if err := ensureDir(dataDirectory); err != nil {
+		panic(err)
+	}
+
+	db, err := openDatabase(databaseFile)
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
 
 	sites, err := LoadSites()
 	if err != nil {
@@ -203,24 +286,13 @@ func main() {
 		sites = sample(sites, *flagTrial)
 	}
 
-	req := make(chan *request, 1000)
-	rsp := make(chan error)
-
-	// start N workers
-	for i := 0; i < N; i++ {
-		go browser(req, rsp)
-	}
-
-	// deliver all the requests
+	w := startWorker(db, "data", 8)
 	for i, site := range sites {
-		req <- &request{ix: i, url: site}
+		w.submit(&request{ix: i, url: site})
 	}
-	close(req)
+	w.close()
 
-	// wait on all workers to finish up or error
-	for i := 0; i < N; i++ {
-		if err := <-rsp; err != nil {
-			panic(err)
-		}
+	if err := w.wait(); err != nil {
+		panic(err)
 	}
 }
