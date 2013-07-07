@@ -3,6 +3,7 @@ package main
 import (
 	"code.google.com/p/gosqlite/sqlite"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -14,12 +15,48 @@ import (
 )
 
 const (
-	phantomJsPath = "phantomjs-1.9.1-macosx/bin/phantomjs"
-	visitJsPath   = "visit.js"
-
-	databaseFile  = "data/db.sqlite3"
-	dataDirectory = "data"
+	databaseFile = "db.sqlite3"
 )
+
+var rootPath string
+var phantomJsPath string
+var visitJsPath string
+
+func setupPaths(root string) error {
+	var err error
+	if root == "" {
+		_, file, _, ok := runtime.Caller(0)
+		if !ok {
+			return errors.New("unable to determine src directory automatically")
+		}
+
+		file = filepath.Join(filepath.Dir(file), "../..")
+
+		root, err = filepath.Abs(file)
+		if err != nil {
+			return err
+		}
+	} else {
+		root, err = filepath.Abs(root)
+		if err != nil {
+			return err
+		}
+	}
+
+	rootPath = root
+	visitJsPath = filepath.Join(root, "src/visit.js")
+	deps := filepath.Join(root, "deps")
+	switch runtime.GOOS {
+	case "linux":
+		phantomJsPath = filepath.Join(deps, "phantomjs-1.9.1-linux-x86_64")
+	case "darwin":
+		phantomJsPath = filepath.Join(deps, "phantomjs-1.9.1-macosx")
+	default:
+		return errors.New(fmt.Sprint("platform unsupported: %s", runtime.GOOS))
+	}
+
+	return nil
+}
 
 type request struct {
 	ix  int
@@ -57,8 +94,8 @@ func (r *request) issue(db *sqlite.Conn, dir string) error {
 	return nil
 }
 
-func LoadSites() ([]string, error) {
-	r, err := os.Open("sites.json")
+func loadSites(file string) ([]string, error) {
+	r, err := os.Open(file)
 	if err != nil {
 		return nil, err
 	}
@@ -241,20 +278,37 @@ func ensureDir(dir string) error {
 	return nil
 }
 
-func openDatabase(dbfile string) (*sqlite.Conn, error) {
+func openDatabase(dbfile string, sites []string) (*sqlite.Conn, error) {
 	db, err := sqlite.Open(dbfile)
 	if err != nil {
 		return nil, err
 	}
 
 	if db.Exec(`CREATE TABLE IF NOT EXISTS visit (
-								id INTEGER PRIMARY KEY,
-								url			VARCHAR(255),
+								url			VARCHAR(255) PRIMARY KEY,
+								rank		INTEGER,
 								cookies TEXT,
-								stdout TEXT,
-								stderr TEXT,
+								stdout  TEXT,
+								stderr  TEXT,
 								success INTEGER);`); err != nil {
 		return nil, err
+	}
+
+	for i, site := range sites {
+		s, err := db.Prepare("SELECT url FROM visit WHERE url=?")
+		if err != nil {
+			return nil, err
+		}
+
+		if err := s.Exec(site); err != nil {
+			return nil, err
+		}
+
+		if !s.Next() {
+			if err := db.Exec("INSERT INTO visit (url, rank, success) VALUES(?1, ?2, 0)", site, i+1); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return db, nil
@@ -263,30 +317,37 @@ func openDatabase(dbfile string) (*sqlite.Conn, error) {
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	flagTrial := flag.Int("trial", 0, "")
+	flagRoot := flag.String("root", "", "the root of the source folder")
+	// flagStopAfter := flag.Int("stop-after", 0, "stop after collecting data on N sites")
+	flagDataDir := flag.String("data-dir", "data", "the path to be used as a data directory")
+	flagWorkers := flag.String("workers", 4, "number of workers")
 
 	flag.Parse()
 
-	if err := ensureDir(dataDirectory); err != nil {
+	if err := setupPaths(*flagRoot); err != nil {
 		panic(err)
 	}
 
-	db, err := openDatabase(databaseFile)
+	if err := ensureDir(*flagDataDir); err != nil {
+		panic(err)
+	}
+
+	sites, err := loadSites(filepath.Join(rootPath, "sites.json"))
+	if err != nil {
+		panic(err)
+	}
+
+	db, err := openDatabase(filepath.Join(*flagDataDir, databaseFile), sites)
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 
-	sites, err := LoadSites()
-	if err != nil {
-		panic(err)
-	}
+	// TODO(knorton): workers need to be restructured to work off of the contents
+	// of the visit table.
+	return
 
-	if *flagTrial > 0 {
-		sites = sample(sites, *flagTrial)
-	}
-
-	w := startWorker(db, "data", 8)
+	w := startWorker(db, *flagDataDir, *flagWorkers)
 	for i, site := range sites {
 		w.submit(&request{ix: i, url: site})
 	}
