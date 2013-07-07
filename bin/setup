@@ -1,0 +1,90 @@
+#!/usr/bin/env python2.7
+
+import os
+import re
+import subprocess
+import sys
+
+
+def on(p):
+  return sys.platform.startswith(p)
+
+def run(cmd):
+  try:
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    out, _ = p.communicate()
+    if p.returncode == 0:
+      return out.strip()
+  except:
+    pass
+  return None
+
+def check_go():
+  def version(path):
+    out = run([path, 'version'])
+    if out is None:
+      return 0
+    m = re.match('go version go(\d\.\d)', out)
+    if m is None:
+      return 0
+    return float(m.groups()[0])
+  go_path = run(['which', 'go'])
+  if go_path is None:
+    go_path = '/usr/local/go/bin/go'
+    if not os.path.exists(go_path):
+      return None
+  if version(go_path) < 1.1:
+    return None
+  return go_path
+
+def check_phantomjs(root):
+  deps = os.path.join(root, 'deps')
+  if not os.path.exists(deps):
+    os.makedirs(deps)
+  if on('darwin'):
+    if os.path.exists(os.path.join(deps, 'phantomjs-1.9.1-macosx')):
+      return True
+    url = 'https://phantomjs.googlecode.com/files/phantomjs-1.9.1-macosx.zip'
+    if subprocess.call(['curl', '-O', url], cwd=deps) != 0:
+      return False
+    if subprocess.call(['unzip', 'phantomjs-1.9.1-macosx.zip'], cwd = deps) != 0:
+      return False
+    return True
+  elif on('linux'):
+    if os.path.exists(os.path.join(deps, 'phantomjs-1.9.1-linux-x86_64')):
+      return True
+    url = 'https://phantomjs.googlecode.com/files/phantomjs-1.9.1-linux-x86_64.tar.bz2'
+    if subprocess.call(['curl', '-O', url], cwd=deps) != 0:
+      return False
+    if subprocess.call(['tar', 'jxvf', 'phantomjs-1.9.1-linux-x86_64.tar.bz2'], cwd=deps) != 0:
+      return False
+    return True
+  else:
+    return False
+
+def main():
+  root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+  
+  go_path = check_go()
+  if go_path is None:
+    print 'go1.1+ is required'
+    return 1
+
+  if not check_phantomjs(root):
+    print 'unable to install phantomjs'
+    return 1
+
+  env = os.environ
+  env['GOPATH'] = root
+  if subprocess.call([go_path, 'get', 'code.google.com/p/gosqlite/sqlite'], cwd=root, env=env) != 0:
+    print 'unable to install gosqlite'
+    return 1
+
+  if subprocess.call([go_path, 'install', 'browse'], cwd=root, env=env) != 0:
+    print 'unable to build'
+    return 1
+    
+  return 0
+
+if __name__ == '__main__':
+  sys.exit(main())

@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	phantomJsPath = "phantomjs-1.8.1-macosx/bin/phantomjs"
+	phantomJsPath = "phantomjs-1.9.1-macosx/bin/phantomjs"
 	visitJsPath   = "visit.js"
 
 	databaseFile  = "data/db.sqlite3"
