@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +14,8 @@ import (
 )
 
 const (
-	databaseFile = "db.sqlite3"
+	databaseFile  = "db.sqlite3"
+	sitesJsonFile = "sites.json"
 )
 
 var rootPath string
@@ -48,9 +48,9 @@ func setupPaths(root string) error {
 	deps := filepath.Join(root, "deps")
 	switch runtime.GOOS {
 	case "linux":
-		phantomJsPath = filepath.Join(deps, "phantomjs-1.9.1-linux-x86_64")
+		phantomJsPath = filepath.Join(deps, "phantomjs-1.9.1-linux-x86_64/bin/phantomjs")
 	case "darwin":
-		phantomJsPath = filepath.Join(deps, "phantomjs-1.9.1-macosx")
+		phantomJsPath = filepath.Join(deps, "phantomjs-1.9.1-macosx/bin/phantomjs")
 	default:
 		return errors.New(fmt.Sprint("platform unsupported: %s", runtime.GOOS))
 	}
@@ -59,8 +59,8 @@ func setupPaths(root string) error {
 }
 
 type request struct {
-	ix  int
-	url string
+	rank int
+	url  string
 }
 
 func (r *request) issue(db *sqlite.Conn, dir string) error {
@@ -75,18 +75,15 @@ func (r *request) issue(db *sqlite.Conn, dir string) error {
 	}
 
 	if err != nil {
-		if err := db.Exec("INSERT OR REPLACE INTO visit VALUES (?1, ?2, NULL, NULL, NULL, 0)",
-			r.ix,
-			r.url); err != nil {
+		if err := db.Exec("UPDATE visit SET success=0 WHERE url=?1", r.url); err != nil {
 			return err
 		}
 	} else {
-		if err := db.Exec("INSERT OR REPLACE INTO visit VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-			r.ix,
-			r.url,
+		if err := db.Exec("UPDATE visit SET success=1, cookies=?1, stdout=?2, stderr=?3 WHERE url = ?4",
 			rsp.cookies,
 			rsp.stdout,
-			rsp.stderr); err != nil {
+			rsp.stderr,
+			r.url); err != nil {
 			return err
 		}
 	}
@@ -185,7 +182,7 @@ func browse(data, url string) (*browseRsp, error) {
 	c := exec.Command(phantomJsPath,
 		fmt.Sprintf("--cookies-file=%s", cookiesFile),
 		fmt.Sprintf("--local-storage-path=%s", storageFile),
-		"visit.js",
+		visitJsPath,
 		url,
 		cookiesJson)
 	c.Stderr = stderr
@@ -211,11 +208,8 @@ func (w *worker) submit(r *request) {
 	w.req <- r
 }
 
-func (w *worker) close() {
-	close(w.req)
-}
-
 func (w *worker) wait() error {
+	close(w.req)
 	for i := 0; i < w.n; i++ {
 		if err := <-w.rsp; err != nil {
 			return err
@@ -236,7 +230,7 @@ func startWorker(db *sqlite.Conn, data string, n int) *worker {
 	for i := 0; i < n; i++ {
 		go func() {
 			for r := range req {
-				data := filepath.Join(data, fmt.Sprintf("%04d", r.ix))
+				data := filepath.Join(data, fmt.Sprintf("%04d", r.rank))
 				if err := ensureDir(data); err != nil {
 					rsp <- err
 					return
@@ -255,20 +249,6 @@ func startWorker(db *sqlite.Conn, data string, n int) *worker {
 	return &w
 }
 
-func sample(sites []string, n int) []string {
-	if n > len(sites) {
-		n = len(sites)
-	}
-
-	p := rand.Perm(n)
-	s := make([]string, n)
-	for i := 0; i < n; i++ {
-		s[i] = sites[p[i]]
-	}
-
-	return s
-}
-
 func ensureDir(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
@@ -278,8 +258,13 @@ func ensureDir(dir string) error {
 	return nil
 }
 
-func openDatabase(dbfile string, sites []string) (*sqlite.Conn, error) {
+func openDatabase(dbfile string) (*sqlite.Conn, error) {
 	db, err := sqlite.Open(dbfile)
+	if err != nil {
+		return nil, err
+	}
+
+	sites, err := loadSites(filepath.Join(rootPath, sitesJsonFile))
 	if err != nil {
 		return nil, err
 	}
@@ -314,13 +299,37 @@ func openDatabase(dbfile string, sites []string) (*sqlite.Conn, error) {
 	return db, nil
 }
 
+func visitsNeeded(db *sqlite.Conn) ([]*request, error) {
+	var reqs []*request
+	s, err := db.Prepare("SELECT url, rank FROM visit WHERE NOT success=1")
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.Exec(); err != nil {
+		return nil, err
+	}
+
+	var url string
+	var rank int
+	for s.Next() {
+		if err := s.Scan(&url, &rank); err != nil {
+			return nil, err
+		}
+
+		reqs = append(reqs, &request{url: url, rank: rank})
+	}
+
+	return reqs, nil
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	flagRoot := flag.String("root", "", "the root of the source folder")
-	// flagStopAfter := flag.Int("stop-after", 0, "stop after collecting data on N sites")
+	flagStopAfter := flag.Int("stop-after", -1, "stop after collecting data on N sites")
 	flagDataDir := flag.String("data-dir", "data", "the path to be used as a data directory")
-	flagWorkers := flag.String("workers", 4, "number of workers")
+	flagWorkers := flag.Int("workers", 4, "number of workers")
 
 	flag.Parse()
 
@@ -332,26 +341,24 @@ func main() {
 		panic(err)
 	}
 
-	sites, err := loadSites(filepath.Join(rootPath, "sites.json"))
-	if err != nil {
-		panic(err)
-	}
-
-	db, err := openDatabase(filepath.Join(*flagDataDir, databaseFile), sites)
+	db, err := openDatabase(filepath.Join(*flagDataDir, databaseFile))
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 
-	// TODO(knorton): workers need to be restructured to work off of the contents
-	// of the visit table.
-	return
+	reqs, err := visitsNeeded(db)
+	if err != nil {
+		panic(err)
+	}
 
 	w := startWorker(db, *flagDataDir, *flagWorkers)
-	for i, site := range sites {
-		w.submit(&request{ix: i, url: site})
+	for i, req := range reqs {
+		if *flagStopAfter >= 0 && i >= *flagStopAfter {
+			break
+		}
+		w.submit(req)
 	}
-	w.close()
 
 	if err := w.wait(); err != nil {
 		panic(err)
