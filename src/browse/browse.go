@@ -331,6 +331,8 @@ func main() {
 	flagDataDir := flag.String("data-dir", "data", "the path to be used as a data directory")
 	flagWorkers := flag.Int("workers", 4, "number of workers")
 
+	flagReport := flag.Bool("report", false, "")
+
 	flag.Parse()
 
 	if err := setupPaths(*flagRoot); err != nil {
@@ -350,6 +352,14 @@ func main() {
 	reqs, err := visitsNeeded(db)
 	if err != nil {
 		panic(err)
+	}
+
+	if *flagReport {
+		for _, req := range reqs {
+			fmt.Printf("%s\n", req.url)
+		}
+		fmt.Printf("%d sites need visiting.\n", len(reqs))
+		return
 	}
 
 	w := startWorker(db, *flagDataDir, *flagWorkers)
