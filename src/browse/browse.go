@@ -2,6 +2,7 @@ package main
 
 import (
 	"code.google.com/p/gosqlite/sqlite"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -107,12 +108,14 @@ func loadSites(file string) ([]string, error) {
 }
 
 type browseRsp struct {
-	stdout  string
-	stderr  string
-	cookies string
+	stdout     string
+	stderr     string
+	cookies    string
+	resources  string
+	screenshot string
 }
 
-func newBrowseRsp(stdout, stderr, cookies string) (*browseRsp, error) {
+func newBrowseRsp(stdout, stderr, cookies, resources, screenshot string) (*browseRsp, error) {
 	o, err := ioutil.ReadFile(stdout)
 	if err != nil {
 		return nil, err
@@ -128,10 +131,22 @@ func newBrowseRsp(stdout, stderr, cookies string) (*browseRsp, error) {
 		return nil, err
 	}
 
+	r, err := ioutil.ReadFile(resources)
+	if err != nil {
+		return nil, err
+	}
+
+	s, err := ioutil.ReadFile(screenshot)
+	if err != nil {
+		return nil, err
+	}
+
 	return &browseRsp{
-		stdout:  string(o),
-		stderr:  string(e),
-		cookies: string(c),
+		stdout:     string(o),
+		stderr:     string(e),
+		cookies:    string(c),
+		resources:  string(r),
+		screenshot: base64.StdEncoding.EncodeToString(s),
 	}, nil
 }
 
@@ -175,16 +190,10 @@ func browse(data, url string) (*browseRsp, error) {
 	}
 	defer stdout.Close()
 
-	cookiesFile := filepath.Join(data, "cookies")
-	storageFile := filepath.Join(data, "storage")
-	cookiesJson := filepath.Join(data, "cookies.json")
-
 	c := exec.Command(phantomJsPath,
-		fmt.Sprintf("--cookies-file=%s", cookiesFile),
-		fmt.Sprintf("--local-storage-path=%s", storageFile),
 		visitJsPath,
 		url,
-		cookiesJson)
+		data)
 	c.Stderr = stderr
 	c.Stdout = stdout
 
@@ -195,7 +204,10 @@ func browse(data, url string) (*browseRsp, error) {
 	stderr.Close()
 	stdout.Close()
 
-	return newBrowseRsp(outFile, errFile, cookiesJson)
+	return newBrowseRsp(outFile, errFile,
+		filepath.Join(data, "cookies.json"),
+		filepath.Join(data, "resources.json"),
+		filepath.Join(data, "capture.png"))
 }
 
 type worker struct {
