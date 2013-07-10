@@ -64,6 +64,19 @@ type request struct {
 	url  string
 }
 
+func updateVisit(db *sqlite.Conn, req *request, rsp *browseRsp, ok bool) error {
+	success := 1
+	if !ok {
+		success = 0
+	}
+
+	err := db.Exec(`
+		UPDATE visit SET success=?1, cookies=?2, resources=?3, screenshot=?4, stdout=?5, stderr=?6
+		WHERE url=?7`,
+		success, rsp.cookies, rsp.resources, rsp.screenshot, rsp.stdout, rsp.stderr, req.url)
+	return err
+}
+
 func (r *request) issue(db *sqlite.Conn, dir string) error {
 	var err error
 	var rsp *browseRsp
@@ -75,18 +88,8 @@ func (r *request) issue(db *sqlite.Conn, dir string) error {
 		}
 	}
 
-	if err != nil {
-		if err := db.Exec("UPDATE visit SET success=0 WHERE url=?1", r.url); err != nil {
-			return err
-		}
-	} else {
-		if err := db.Exec("UPDATE visit SET success=1, cookies=?1, stdout=?2, stderr=?3 WHERE url = ?4",
-			rsp.cookies,
-			rsp.stdout,
-			rsp.stderr,
-			r.url); err != nil {
-			return err
-		}
+	if we := updateVisit(db, r, rsp, err == nil); we != nil {
+		return we
 	}
 
 	return nil
@@ -115,39 +118,19 @@ type browseRsp struct {
 	screenshot string
 }
 
-func newBrowseRsp(stdout, stderr, cookies, resources, screenshot string) (*browseRsp, error) {
-	o, err := ioutil.ReadFile(stdout)
-	if err != nil {
-		return nil, err
-	}
-
-	e, err := ioutil.ReadFile(stderr)
-	if err != nil {
-		return nil, err
-	}
-
-	c, err := ioutil.ReadFile(cookies)
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := ioutil.ReadFile(resources)
-	if err != nil {
-		return nil, err
-	}
-
-	s, err := ioutil.ReadFile(screenshot)
-	if err != nil {
-		return nil, err
-	}
-
+func newBrowseRsp(stdout, stderr, cookies, resources, screenshot string) *browseRsp {
+	o, _ := ioutil.ReadFile(stdout)
+	e, _ := ioutil.ReadFile(stderr)
+	c, _ := ioutil.ReadFile(cookies)
+	r, _ := ioutil.ReadFile(resources)
+	s, _ := ioutil.ReadFile(screenshot)
 	return &browseRsp{
 		stdout:     string(o),
 		stderr:     string(e),
 		cookies:    string(c),
 		resources:  string(r),
 		screenshot: base64.StdEncoding.EncodeToString(s),
-	}, nil
+	}
 }
 
 func clean(dir string) error {
@@ -197,9 +180,7 @@ func browse(data, url string) (*browseRsp, error) {
 	c.Stderr = stderr
 	c.Stdout = stdout
 
-	if err := c.Run(); err != nil {
-		return nil, err
-	}
+	err = c.Run()
 
 	stderr.Close()
 	stdout.Close()
@@ -207,7 +188,7 @@ func browse(data, url string) (*browseRsp, error) {
 	return newBrowseRsp(outFile, errFile,
 		filepath.Join(data, "cookies.json"),
 		filepath.Join(data, "resources.json"),
-		filepath.Join(data, "capture.png"))
+		filepath.Join(data, "capture.png")), err
 }
 
 type worker struct {
@@ -282,12 +263,14 @@ func openDatabase(dbfile string) (*sqlite.Conn, error) {
 	}
 
 	if db.Exec(`CREATE TABLE IF NOT EXISTS visit (
-								url			VARCHAR(255) PRIMARY KEY,
-								rank		INTEGER,
-								cookies TEXT,
-								stdout  TEXT,
-								stderr  TEXT,
-								success INTEGER);`); err != nil {
+								url			   VARCHAR(255) PRIMARY KEY,
+								rank		   INTEGER,
+								cookies    TEXT,
+								resources  TEXT,
+								screenshot TEXT,
+								stdout     TEXT,
+								stderr     TEXT,
+								success    INTEGER);`); err != nil {
 		return nil, err
 	}
 
