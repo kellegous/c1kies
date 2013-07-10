@@ -1,6 +1,7 @@
 #!/usr/bin/env python2.7
 
 import os
+import optparse
 import re
 import subprocess
 import sys
@@ -62,9 +63,20 @@ def check_phantomjs(root):
   else:
     return False
 
+def setup_ec2(root):
+  pkgs = ['hg']
+  return subprocess.call(['sudo', 'yum', 'install'] + pkgs) == 0
+
 def main():
   root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
   
+  parser = optparse.OptionParser()
+  parser.add_option('--ec2', action='store_true', default=False, help='setup an ec2 instance')
+  opts, args = parser.parse_args()
+
+  if opts.ec2 and not setup_ec2(root):
+    return 1
+
   go_path = check_go()
   if go_path is None:
     print 'go1.1+ is required'
